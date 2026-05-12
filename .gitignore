@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Node / JS Extension
+tongue-extension/node_modules/
+
+# Models & Large Data
+models/
+tts_models/
+*.pt
+*.bin
+*.onnx
+
+# Temp Audio Files
+*.wav
+*.webm
+*.mp3
+!reference.wav
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
