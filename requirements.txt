@@ -6,3 +6,5 @@ deep-translator==1.11.4
 TTS==0.22.0
 transformers==4.38.1
 pydantic<2.0
+moviepy==1.0.3
+demucs==4.0.1

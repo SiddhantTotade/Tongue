@@ -13,73 +13,41 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Tongue - Human-like Translator")
 engine = TranslationEngine()
 
-# main.py Snippet
-@app.websocket("/ws/stream")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    current_lang = "hi"
-    
-    try:
-        while True:
-            message = await websocket.receive()
-            
-            if "text" in message:
-                import json
-                try:
-                    data = json.loads(message["text"])
-                    if data.get("type") == "config":
-                        current_lang = data.get("lang", current_lang)
-                        logger.info(f"Language switched to {current_lang}")
-                except json.JSONDecodeError:
-                    logger.error("Failed to parse WebSocket text message")
-                    
-            elif "bytes" in message:
-                audio_bytes = message["bytes"]
-                output_path = await engine.process_chunk(audio_bytes, current_lang)
-                
-                with open(output_path, "rb") as f:
-                    await websocket.send_bytes(f.read())
-                
-    except WebSocketDisconnect:
-        logger.info("Client disconnected")
-
-@app.post("/translate")
-async def translate_audio(audio: UploadFile = File(...), target_lang: str = Form("hi")):
+@app.post("/translate-video")
+async def translate_video(video: UploadFile = File(...), target_lang: str = Form("hi")):
     """
-    Translates uploaded audio to the target language with human-like speech.
+    Translates an uploaded video file to the target language, cloning the original speaker's emotion and voice.
+    Supports standard video formats (mp4, mkv, mov, etc.).
     """
-    temp_input = f"temp_{audio.filename}"
+    # Use the original filename extension but save locally to process
+    ext = os.path.splitext(video.filename)[1]
+    if not ext:
+        ext = ".mp4" # fallback
+        
+    temp_input = f"temp_upload{ext}"
     
     try:
         with open(temp_input, "wb") as buffer:
-            shutil.copyfileobj(audio.file, buffer)
+            shutil.copyfileobj(video.file, buffer)
         
-        translated_audio_path = await engine.process(temp_input, target_lang)
+        # Process the video
+        translated_video_path = await engine.process_video(temp_input, target_lang)
         
         return FileResponse(
-            translated_audio_path, 
-            media_type="audio/wav",
-            filename=os.path.basename(translated_audio_path)
+            translated_video_path, 
+            media_type="video/mp4",
+            filename=os.path.basename(translated_video_path)
         )
     except Exception as e:
-        logger.error(f"Translation failed: {str(e)}")
+        logger.error(f"Video translation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup is handled inside engine.process, but just in case of failure:
+        # Cleanup uploaded raw file
         if os.path.exists(temp_input):
-            os.remove(temp_input)
-
-@app.post("/set-reference")
-async def set_reference(audio: UploadFile = File(...)):
-    """
-    Upload a 6-10 second high-quality audio clip to use for voice cloning.
-    """
-    try:
-        with open("reference.wav", "wb") as buffer:
-            shutil.copyfileobj(audio.file, buffer)
-        return {"message": "Reference voice updated successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save reference: {str(e)}")
+            try:
+                os.remove(temp_input)
+            except Exception:
+                pass
 
 @app.get("/languages")
 async def get_languages():

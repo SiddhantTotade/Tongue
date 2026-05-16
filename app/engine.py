@@ -21,7 +21,7 @@ class TranslationEngine:
         # float16 for CUDA, int8 for CPU
         compute_type = "float16" if self.device == "cuda" else "int8"
         self.stt_model = WhisperModel(
-            "large-v3",
+            "base", # Changed from large-v3 for much faster real-time processing
             device=self.device,
             compute_type=compute_type,
             download_root="/app/models/whisper"
@@ -35,48 +35,63 @@ class TranslationEngine:
         
         # Ensure models directory exists
         os.makedirs("/app/models/xtts", exist_ok=True)
-    
-    # Add this to your TranslationEngine class in engine.py
-    async def process_stream(self, audio_bytes, target_lang):
-        # Save bytes to a temp file or use a buffer
-        temp_input = "stream_input.wav"
-        with open(temp_input, "wb") as f:
-            f.write(audio_bytes)
-        
-        # Reuse your existing logic but return the bytes of the output
-        output_path = await self.process(temp_input, target_lang)
-    
-        with open(output_path, "rb") as f:
-            return f.read()
-    
-    # Add to your engine.py
 
-    async def process_chunk(self, audio_bytes, target_lang):
-        # Use a temporary file to store the incoming chunk
-        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_in:
-            temp_in.write(audio_bytes)
-            temp_in_path = temp_in.name
-
-        try:
-            # Run your existing translation/cloning logic
-            output_path = await self.process(temp_in_path, target_lang)
-            
-            with open(output_path, "rb") as f:
-                return f.read()
-        finally:
-            # Cleanup to prevent disk bloat
-            if os.path.exists(temp_in_path):
-                os.remove(temp_in_path)
-
-    async def process(self, audio_path, target_lang):
+    async def process_video(self, video_path, target_lang):
         loop = asyncio.get_running_loop()
         
         try:
-            # 1. Speech to Text (Non-blocking)
+            from moviepy.editor import VideoFileClip, AudioFileClip
+            
+            # 1. Extract audio from video to use as dynamic emotion/voice reference
+            def extract_audio():
+                logger.info(f"Extracting audio from {video_path}...")
+                video = VideoFileClip(video_path)
+                audio_ext_path = f"temp_extracted_{os.path.basename(video_path)}.wav"
+                video.audio.write_audiofile(audio_ext_path, logger=None)
+                video.close()
+                return audio_ext_path
+            
+            extracted_audio_path = await loop.run_in_executor(None, extract_audio)
+            
+            # 1.5 Isolate vocals and background
+            def isolate_audio():
+                logger.info(f"Isolating vocals and background from {extracted_audio_path}...")
+                import subprocess
+                output_dir = "separated_audio"
+                
+                # Demucs CLI: separates into vocals.wav and no_vocals.wav
+                cmd = [
+                    "python", "-m", "demucs.separate", 
+                    "-n", "htdemucs", 
+                    "--two-stems=vocals", 
+                    "-o", output_dir, 
+                    extracted_audio_path
+                ]
+                subprocess.run(cmd, check=True)
+                
+                base_name = os.path.splitext(os.path.basename(extracted_audio_path))[0]
+                model_out_dir = os.path.join(output_dir, "htdemucs", base_name)
+                
+                v_path = os.path.join(model_out_dir, "vocals.wav")
+                b_path = os.path.join(model_out_dir, "no_vocals.wav")
+                
+                if not os.path.exists(v_path) or not os.path.exists(b_path):
+                    raise Exception(f"Demucs failed: Expected files not found in {model_out_dir}")
+                    
+                return v_path, b_path, output_dir
+                
+            vocals_path, bg_path, demucs_out_dir = await loop.run_in_executor(None, isolate_audio)
+            
+            # 2. Transcribe Isolated Vocals
             def transcribe():
-                logger.info("Starting transcription...")
-                segments, info = self.stt_model.transcribe(audio_path, beam_size=5)
-                # Iterate inside the executor to avoid blocking the event loop
+                logger.info("Starting transcription on isolated vocals...")
+                segments, info = self.stt_model.transcribe(
+                    vocals_path, 
+                    beam_size=1, 
+                    language="en", 
+                    vad_filter=True, 
+                    condition_on_previous_text=False
+                )
                 text = " ".join([segment.text for segment in segments])
                 return text
 
@@ -84,67 +99,134 @@ class TranslationEngine:
             
             if not english_text.strip():
                 logger.warning("No speech detected.")
-                return audio_path
-
+                return video_path
+                
             logger.info(f"Transcribed: {english_text}")
-
-            # 2. Translation
-            # Wrapping sync call in executor
+            
+            # 3. Translate
             translated_text = await loop.run_in_executor(
                 None, 
-                lambda: GoogleTranslator(source='auto', target=target_lang).translate(english_text)
+                lambda: GoogleTranslator(source='en', target=target_lang).translate(english_text)
             )
             logger.info(f"Translated ({target_lang}): {translated_text}")
-
-            # 3. Human-like Text to Speech (XTTS v2)
-            output_filename = f"translated_{os.path.basename(audio_path)}.wav"
-            output_path = os.path.join(os.getcwd(), output_filename)
             
-            # For XTTS, we need a reference speaker. 
-            # NOTE: For best results, the user should provide 'reference.wav'
-            # We'll use a placeholder speaker if reference.wav is missing, 
-            # though XTTS usually requires a file.
-           # This looks in the same folder as engine.py
-            ref_path = os.path.join(os.path.dirname(__file__), "reference.wav")
-            
-            # Check if reference exists, if not, we might need a fallback or fail gracefully
-            if not os.path.exists(ref_path):
-                logger.warning("reference.wav not found! Please provide a 6-10s high-quality audio clip as 'reference.wav' for voice cloning.")
-                # We will try to use the first available speaker if possible, 
-                # but XTTS v2 API usually needs a wav for the 'speaker_wav' argument.
-                # If no reference, this might error. I'll add an endpoint to upload it.
-
+            # 4. Generate TTS using the isolated vocals as the clean reference
             def generate_tts():
-                # XTTS v2 supports many languages including hi, mr, ta, etc.
-                # If no reference.wav, we try to use a default speaker if possible,
-                # but XTTS v2 usually requires a reference wav for cloning.
-                # For now, we'll pass the speaker_wav only if it exists.
-                kwargs = {
-                    "text": translated_text,
-                    "language": target_lang,
-                    "file_path": output_path
-                }
+                output_audio_path = f"translated_audio_{os.path.basename(video_path)}.wav"
                 
-                if os.path.exists(ref_path):
-                    kwargs["speaker_wav"] = ref_path
+                logger.info("Computing conditioning latents from isolated vocals for clean emotion cloning...")
+                gpt_cond_latent, speaker_embedding = self.tts.synthesizer.tts_model.get_conditioning_latents(audio_path=[vocals_path])
+                
+                # Split text into chunks to avoid the XTTS 400 token limit
+                import re
+                import numpy as np
+                
+                # Split by sentence terminators including Hindi Purna Viram (।)
+                sentences = re.split(r'(?<=[.!?।])\s+', translated_text)
+                chunks = []
+                current_chunk = ""
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < 200:
+                        current_chunk += sentence + " "
+                    else:
+                        if current_chunk.strip():
+                            chunks.append(current_chunk.strip())
+                        # If a single sentence is still too long, we forcefully split it
+                        if len(sentence) >= 200:
+                            words = sentence.split()
+                            temp_chunk = ""
+                            for word in words:
+                                if len(temp_chunk) + len(word) < 200:
+                                    temp_chunk += word + " "
+                                else:
+                                    chunks.append(temp_chunk.strip())
+                                    temp_chunk = word + " "
+                            current_chunk = temp_chunk
+                        else:
+                            current_chunk = sentence + " "
+                
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+                    
+                all_wavs = []
+                for chunk in chunks:
+                    if not chunk.strip(): continue
+                    logger.info(f"Generating TTS for chunk: {chunk[:30]}...")
+                    out = self.tts.synthesizer.tts_model.inference(
+                        text=chunk,
+                        language=target_lang,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        temperature=0.7,
+                    )
+                    all_wavs.append(np.array(out["wav"]))
+                    
+                if all_wavs:
+                    wav = np.concatenate(all_wavs)
                 else:
-                    # Fallback to a built-in speaker if possible
-                    # Note: xtts_v2 doesn't always have a 'default' speaker name, 
-                    # it prefers reference wavs. We'll use a known one if we can.
-                    logger.warning("No reference.wav found. Attempting to use default speaker 'Damien Sincere'.")
-                    kwargs["speaker"] = "Damien Sincere" 
+                    wav = np.zeros(24000)
+                
+                import torchaudio
+                if isinstance(wav, list):
+                    wav = torch.tensor(wav)
+                elif not isinstance(wav, torch.Tensor):
+                    wav = torch.from_numpy(np.array(wav))
+                    
+                if wav.dim() == 1:
+                    wav = wav.unsqueeze(0)
+                    
+                torchaudio.save(output_audio_path, wav.cpu(), 24000)
+                return output_audio_path
 
-                self.tts.tts_to_file(**kwargs)
-                return output_path
-
-            await loop.run_in_executor(None, generate_tts)
-
-            # Cleanup input
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-
-            return output_path
-
+            tts_audio_path = await loop.run_in_executor(None, generate_tts)
+            
+            # 5. Mix Audio and Mux back to Video
+            def mux_video():
+                logger.info("Mixing translated audio with background track and muxing into video...")
+                from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+                video = VideoFileClip(video_path)
+                
+                new_vocals = AudioFileClip(tts_audio_path)
+                bg_audio = AudioFileClip(bg_path)
+                
+                # Combine vocals and background
+                mixed_audio = CompositeAudioClip([bg_audio, new_vocals])
+                
+                final_video = video.set_audio(mixed_audio)
+                
+                # Output as .mp4 regardless of input format to ensure universal compatibility
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                output_video_path = f"translated_{base_name}.mp4"
+                
+                final_video.write_videofile(
+                    output_video_path, 
+                    codec="libx264", 
+                    audio_codec="aac", 
+                    logger=None
+                )
+                
+                video.close()
+                new_vocals.close()
+                bg_audio.close()
+                final_video.close()
+                
+                return output_video_path
+                
+            final_video_path = await loop.run_in_executor(None, mux_video)
+            
+            # Cleanup
+            import shutil
+            for p in [extracted_audio_path, tts_audio_path, video_path]:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+            if os.path.exists(demucs_out_dir):
+                shutil.rmtree(demucs_out_dir, ignore_errors=True)
+                        
+            return final_video_path
+            
         except Exception as e:
-            logger.error(f"Error in processing: {str(e)}")
+            logger.error(f"Error in video processing: {str(e)}")
             raise e
